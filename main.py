@@ -1,12 +1,13 @@
-from windows_capture import WindowsCapture
-from PIL import Image
-import numpy as np
-
-import zipfile
 import os
 import time
+import zipfile
+import threading
 import ctypes
 from ctypes import wintypes
+
+import numpy as np
+
+from windows_capture import WindowsCapture
 
 
 # ============================================================
@@ -36,11 +37,31 @@ INPUT_MODFS = os.path.join(
 RGB_FILENAME = "rgb.txt"
 INPUT_FILENAME = "input.txt"
 
-Snes9x window should be focused for SendInput to reach it.
+
+# ============================================================
+# THREAD STATE
+# ============================================================
+
+running = True
+
+frame_lock = threading.Lock()
+
+latest_frame = None
+
+frame_changed = False
 
 
 # ============================================================
-# WINDOWS KEYBOARD
+# INPUT STATE
+# ============================================================
+
+last_input_data = None
+
+input_lock = threading.Lock()
+
+
+# ============================================================
+# WINDOWS KEYBOARD API
 # ============================================================
 
 user32 = ctypes.windll.user32
@@ -57,7 +78,10 @@ class KEYBDINPUT(ctypes.Structure):
         ("wScan", wintypes.WORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))
+        (
+            "dwExtraInfo",
+            ctypes.POINTER(wintypes.ULONG)
+        )
     ]
 
 
@@ -70,7 +94,7 @@ class INPUT(ctypes.Structure):
 
 
 # ============================================================
-# KEY CODES
+# WINDOWS VIRTUAL KEYS
 # ============================================================
 
 VK_W = 0x57
@@ -89,30 +113,30 @@ VK_E = 0x45
 
 
 # ============================================================
-# CURRENT KEY STATE
+# KEY STATE
 # ============================================================
 
 current_keys = {}
 
 
-def send_key(vk, down):
+def send_key(vk, pressed):
 
-    previous = current_keys.get(vk, False)
+    previous = current_keys.get(
+        vk,
+        False
+    )
 
-    if previous == down:
+    if previous == pressed:
         return
 
-    current_keys[vk] = down
-
+    current_keys[vk] = pressed
 
     flags = 0
 
-    if not down:
+    if not pressed:
         flags |= KEYEVENTF_KEYUP
 
-
     extra = wintypes.ULONG(0)
-
 
     keyboard_input = INPUT(
         type=INPUT_KEYBOARD,
@@ -124,7 +148,6 @@ def send_key(vk, down):
             dwExtraInfo=ctypes.pointer(extra)
         )
     )
-
 
     user32.SendInput(
         1,
@@ -139,14 +162,18 @@ def send_key(vk, down):
 
 def release_all_keys():
 
-    for vk, pressed in list(current_keys.items()):
+    for vk in list(current_keys.keys()):
 
-        if pressed:
-            send_key(vk, False)
+        if current_keys[vk]:
+
+            send_key(
+                vk,
+                False
+            )
 
 
 # ============================================================
-# INPUT -> SNES9X
+# APPLY EARTHBOUND INPUT
 # ============================================================
 
 def apply_input(values):
@@ -155,112 +182,69 @@ def apply_input(values):
         return
 
 
-    up = values[0]
-    down = values[1]
-    left = values[2]
-    right = values[3]
+    up = values[0] != 0
+    down = values[1] != 0
+    left = values[2] != 0
+    right = values[3] != 0
 
-    a = values[4]
-    b = values[5]
+    a = values[4] != 0
+    b = values[5] != 0
 
-    l = values[6]
-    r = values[7]
+    l = values[6] != 0
+    r = values[7] != 0
 
-    x = values[8]
-    y = values[9]
+    x = values[8] != 0
+    y = values[9] != 0
 
 
     # --------------------------------------------------------
     # D-PAD
     # --------------------------------------------------------
 
-    send_key(
-        VK_W,
-        up
-    )
-
-    send_key(
-        VK_S,
-        down
-    )
-
-    send_key(
-        VK_A,
-        left
-    )
-
-    send_key(
-        VK_D,
-        right
-    )
+    send_key(VK_W, up)
+    send_key(VK_S, down)
+    send_key(VK_A, left)
+    send_key(VK_D, right)
 
 
     # --------------------------------------------------------
-    # SNES BUTTONS
+    # BUTTONS
     # --------------------------------------------------------
 
-    send_key(
-        VK_SPACE,
-        a
-    )
+    send_key(VK_SPACE, a)
+    send_key(VK_CONTROL, b)
 
-    send_key(
-        VK_CONTROL,
-        b
-    )
+    send_key(VK_1, l)
+    send_key(VK_2, r)
 
-    send_key(
-        VK_1,
-        l
-    )
-
-    send_key(
-        VK_2,
-        r
-    )
-
-    send_key(
-        VK_Q,
-        x
-    )
-
-    send_key(
-        VK_E,
-        y
-    )
+    send_key(VK_Q, x)
+    send_key(VK_E, y)
 
 
 # ============================================================
 # READ INPUT MODFS
 # ============================================================
 
-last_input = None
+def read_input_modfs():
 
-
-def read_input():
-
-    global last_input
-
+    global last_input_data
 
     if not os.path.exists(INPUT_MODFS):
         return
-
 
     try:
 
         with zipfile.ZipFile(
             INPUT_MODFS,
             "r"
-        ) as z:
+        ) as archive:
 
-            data =
-                z.read(
-                    INPUT_FILENAME
-                ).decode(
-                    "utf-8",
-                    errors="ignore"
-                )
-
+            data = archive.read(
+                INPUT_FILENAME
+            ).decode(
+                "utf-8",
+                errors="ignore"
+            )
 
     except (
         zipfile.BadZipFile,
@@ -269,41 +253,65 @@ def read_input():
         KeyError
     ):
 
-        # Lua may currently be saving the ModFS.
-        # Just try again next loop.
+        # Lua may be in the middle of saving.
         return
 
 
     data = data.strip()
 
-
     if not data:
         return
 
 
-    if data == last_input:
+    if data == last_input_data:
         return
-
-
-    last_input = data
 
 
     try:
 
         values = [
-            int(x)
-            for x in data.split(",")
+            int(value)
+            for value in data.split(",")
         ]
 
     except ValueError:
+
         return
 
+
+    if len(values) != 10:
+        return
+
+
+    last_input_data = data
 
     apply_input(values)
 
 
 # ============================================================
-# RGB MODFS
+# INPUT THREAD
+# ============================================================
+
+def input_worker():
+
+    while running:
+
+        try:
+
+            read_input_modfs()
+
+        except Exception as error:
+
+            print(
+                "[INPUT] Error:",
+                repr(error)
+            )
+
+        time.sleep(0.005)
+
+
+# ============================================================
+# CREATE RGB MODFS
 # ============================================================
 
 def write_rgb_modfs(rgb_text):
@@ -313,142 +321,248 @@ def write_rgb_modfs(rgb_text):
         exist_ok=True
     )
 
+    temporary_path = RGB_MODFS + ".tmp"
 
-    temp_path =
-        RGB_MODFS + ".tmp"
-
-
-    # --------------------------------------------------------
-    # Write a completely new ZIP.
-    # --------------------------------------------------------
 
     with zipfile.ZipFile(
-        temp_path,
+        temporary_path,
         "w",
         compression=zipfile.ZIP_DEFLATED,
         compresslevel=1
-    ) as z:
+    ) as archive:
 
-        z.writestr(
+        archive.writestr(
             RGB_FILENAME,
             rgb_text
         )
 
 
-    # --------------------------------------------------------
-    # Replace the old ModFS atomically.
-    # --------------------------------------------------------
-
     os.replace(
-        temp_path,
+        temporary_path,
         RGB_MODFS
     )
 
 
 # ============================================================
-# SCREEN -> RGB TEXT
+# FRAME -> RGB TEXT
 # ============================================================
 
-def image_to_rgb_text(image):
+def frame_to_rgb_text(frame_buffer):
 
-    image =
-        image.resize(
-            (WIDTH, HEIGHT),
-            Image.Resampling.NEAREST
-        ).convert("RGB")
+    # --------------------------------------------------------
+    # Windows Capture gives BGRA.
+    # We only need BGR here, then reverse to RGB.
+    # --------------------------------------------------------
 
-
-    array =
-        np.asarray(image)
+    image = frame_buffer[:, :, :3]
 
 
-    lines = []
+    # --------------------------------------------------------
+    # Resize directly with nearest-neighbor.
+    # --------------------------------------------------------
+
+    source_height = image.shape[0]
+    source_width = image.shape[1]
 
 
-    for row in array:
+    if (
+        source_width == WIDTH
+        and
+        source_height == HEIGHT
+    ):
 
-        for pixel in row:
+        resized = image
 
-            r = int(pixel[0])
-            g = int(pixel[1])
-            b = int(pixel[2])
+    else:
+
+        x_indices = (
+            np.arange(WIDTH)
+            * source_width
+            // WIDTH
+        )
+
+        y_indices = (
+            np.arange(HEIGHT)
+            * source_height
+            // HEIGHT
+        )
+
+        resized = image[
+            y_indices[:, None],
+            x_indices[None, :]
+        ]
 
 
-            lines.append(
-                f"{r},{g},{b}"
-            )
+    # --------------------------------------------------------
+    # BGRA/BGR -> RGB
+    # --------------------------------------------------------
+
+    rgb = resized[:, :, ::-1]
+
+
+    # --------------------------------------------------------
+    # Generate RGB text.
+    # --------------------------------------------------------
+
+    flat = rgb.reshape(
+        -1,
+        3
+    )
+
+
+    lines = [
+        f"{int(pixel[0])},"
+        f"{int(pixel[1])},"
+        f"{int(pixel[2])}"
+        for pixel in flat
+    ]
 
 
     return "\n".join(lines)
 
 
 # ============================================================
-# CAPTURE
+# RGB WORKER
+# ============================================================
+
+def rgb_worker():
+
+    global latest_frame
+    global frame_changed
+
+    last_written_frame = None
+
+    while running:
+
+        frame = None
+
+        with frame_lock:
+
+            if frame_changed:
+
+                frame = latest_frame.copy()
+
+                frame_changed = False
+
+
+        if frame is None:
+
+            time.sleep(0.001)
+
+            continue
+
+
+        try:
+
+            rgb_text = frame_to_rgb_text(
+                frame
+            )
+
+
+            # ------------------------------------------------
+            # Don't rewrite the ModFS if the RGB image didn't
+            # actually change.
+            # ------------------------------------------------
+
+            if rgb_text == last_written_frame:
+
+                continue
+
+
+            write_rgb_modfs(
+                rgb_text
+            )
+
+
+            last_written_frame = rgb_text
+
+        except Exception as error:
+
+            print(
+                "[RGB] Worker error:",
+                repr(error)
+            )
+
+            time.sleep(0.01)
+
+
+# ============================================================
+# WINDOWS CAPTURE
 # ============================================================
 
 capture = WindowsCapture(
-    cursor_capture=False
+    cursor_capture=False,
+    draw_border=False
 )
 
 
+# ============================================================
+# FRAME CALLBACK
+# ============================================================
+
 @capture.event
-def on_frame_arrived(frame, capture_control):
+def on_frame_arrived(
+    frame,
+    capture_control
+):
 
-    # --------------------------------------------------------
-    # Read multiplayer input every captured frame.
-    # --------------------------------------------------------
+    global latest_frame
+    global frame_changed
 
-    read_input()
-
-
-    # --------------------------------------------------------
-    # Capture Snes9x.
-    # --------------------------------------------------------
-
-    image =
-        frame.convert_to_pil()
-
-
-    # --------------------------------------------------------
-    # Convert to EarthBound framebuffer.
-    # --------------------------------------------------------
-
-    rgb_text =
-        image_to_rgb_text(
-            image
-        )
-
-
-    # --------------------------------------------------------
-    # Write framebuffer.
-    # --------------------------------------------------------
 
     try:
 
-        write_rgb_modfs(
-            rgb_text
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Do NOT read ZIP files here.
+        # Do NOT write ZIP files here.
+        # Do NOT perform PIL conversion here.
+        #
+        # Only copy the captured pixels and return.
+        # ----------------------------------------------------
+
+        buffer = np.array(
+            frame.frame_buffer,
+            copy=True
         )
 
-    except OSError as e:
+
+        with frame_lock:
+
+            latest_frame = buffer
+
+            frame_changed = True
+
+
+    except Exception as error:
 
         print(
-            "[RGB] ModFS write error:",
-            e
+            "[CAPTURE] Frame error:",
+            repr(error)
         )
 
+
+# ============================================================
+# CAPTURE CLOSED
+# ============================================================
 
 @capture.event
 def on_closed():
+
+    global running
+
+    running = False
+
+    release_all_keys()
 
     print(
         "[CAPTURE] Capture closed"
     )
 
-    release_all_keys()
-
 
 # ============================================================
-# MAIN
+# START
 # ============================================================
 
 print(
@@ -464,7 +578,7 @@ print(
 )
 
 print(
-    "Framebuffer:"
+    "RGB ModFS:"
 )
 
 print(
@@ -474,7 +588,7 @@ print(
 print()
 
 print(
-    "Input:"
+    "Input ModFS:"
 )
 
 print(
@@ -488,20 +602,31 @@ print(
 )
 
 print(
-    "W/A/S/D = D-Pad"
+    "W = Up"
 )
 
 print(
-    "Space = A"
+    "A = Left"
 )
 
 print(
-    "Ctrl = B"
+    "S = Down"
+)
+
+print(
+    "D = Right"
+)
+
+print(
+    "SPACE = A"
+)
+
+print(
+    "CTRL = B"
 )
 
 print(
     "1 = L"
-
 )
 
 print(
@@ -516,21 +641,51 @@ print(
     "E = Y"
 )
 
-print()
-
-print(
-    "Make sure Snes9x has focus."
-)
-
 print(
     "============================================"
 )
 
 
+# ============================================================
+# WORKERS
+# ============================================================
+
+input_thread = threading.Thread(
+    target=input_worker,
+    daemon=True
+)
+
+rgb_thread = threading.Thread(
+    target=rgb_worker,
+    daemon=True
+)
+
+
+input_thread.start()
+rgb_thread.start()
+
+
+# ============================================================
+# CAPTURE
+# ============================================================
+
 try:
 
     capture.start()
 
+except Exception as error:
+
+    print(
+        "[CAPTURE] Fatal error:",
+        repr(error)
+    )
+
 finally:
 
+    running = False
+
     release_all_keys()
+
+    print(
+        "[BRIDGE] Stopped."
+    )
