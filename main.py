@@ -141,7 +141,8 @@ def write_rgb_to_modfs(rgb_text):
 
     with write_lock:
 
-        temp_path = MODFS_PATH + ".tmp"
+        temp_path =
+            MODFS_PATH + ".tmp"
 
 
         # ----------------------------------------------------
@@ -223,20 +224,20 @@ def write_rgb_to_modfs(rgb_text):
 
 def frame_to_rgb(frame):
 
-   # """
-    #Capture:
+    """
+    Capture:
 
-        #approximately 600x500
+        approximately 600x500
 
-    #Output:
+    Output:
 
-        #exactly 301x224 RGB
+        exactly 301x224 RGB
 
-    #The capture is taken from the entire Snes9x window.
+    The capture is taken from the entire Snes9x window.
 
-    #We crop the CENTER of that capture to the 301x224
-    #framebuffer used by Lua.
-   # ""
+    We crop the CENTER of that capture to the 301x224
+    framebuffer used by Lua.
+    """
 
     buffer = frame.frame_buffer
 
