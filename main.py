@@ -1,7 +1,6 @@
 import os
 import zipfile
 import threading
-
 import numpy as np
 
 from windows_capture import (
@@ -10,24 +9,27 @@ from windows_capture import (
     InternalCaptureControl,
 )
 
-
 # ============================================================
 # SETTINGS
 # ============================================================
 
 WINDOW_NAME = "Snes9x"
 
-WIDTH = 64
-HEIGHT = 54
+# Output framebuffer
+OUTPUT_WIDTH = 128
+OUTPUT_HEIGHT = 96
+
+# Expected Snes9x capture
+CAPTURE_WIDTH = 600
+CAPTURE_HEIGHT = 500
 
 MODFS_PATH = os.path.expandvars(
-    r"%APPDATA%\sm64coopdx\sav\earthbound.modfs"
+    r"%APPDATA%\sm64coopdx\sav\Earthbound.modfs"
 )
 
 RGB_FILENAME = "rgb.txt"
 
 MINIMUM_UPDATE_INTERVAL = 16
-
 
 # ============================================================
 # STATE
@@ -39,7 +41,7 @@ last_rgb_text = None
 
 
 # ============================================================
-# CREATE / VERIFY MODFS
+# MODFS
 # ============================================================
 
 def ensure_modfs():
@@ -71,11 +73,10 @@ def ensure_modfs():
 
         return
 
-
     if not zipfile.is_zipfile(MODFS_PATH):
 
         print(
-            "[PYTHON] Invalid ModFS. Recreating."
+            "[PYTHON] Earthbound.modfs is not a valid ZIP."
         )
 
         try:
@@ -94,6 +95,10 @@ def ensure_modfs():
                 ""
             )
 
+        print(
+            "[PYTHON] Recreated valid Earthbound.modfs."
+        )
+
 
 # ============================================================
 # WRITE RGB.TXT
@@ -106,17 +111,11 @@ def write_rgb_to_modfs(rgb_text):
     if rgb_text == last_rgb_text:
         return
 
-
     with write_lock:
 
-        temp_path = (
-            MODFS_PATH +
-            ".tmp"
-        )
-
+        temp_path = MODFS_PATH + ".tmp"
 
         old_files = {}
-
 
         try:
 
@@ -146,6 +145,9 @@ def write_rgb_to_modfs(rgb_text):
 
             old_files = {}
 
+        # ----------------------------------------------------
+        # Build completely new ZIP.
+        # ----------------------------------------------------
 
         with zipfile.ZipFile(
             temp_path,
@@ -160,201 +162,141 @@ def write_rgb_to_modfs(rgb_text):
                     content
                 )
 
-
             new_zip.writestr(
                 RGB_FILENAME,
                 rgb_text
             )
 
+        # ----------------------------------------------------
+        # Atomic replacement.
+        # ----------------------------------------------------
 
         os.replace(
             temp_path,
             MODFS_PATH
         )
 
-
         last_rgb_text = rgb_text
 
 
 # ============================================================
-# MATHEMATICAL NEAREST-NEIGHBOR RESIZE
-# ============================================================
-
-def resize_nearest(
-    image,
-    new_width,
-    new_height
-):
-
-    source_height = image.shape[0]
-    source_width = image.shape[1]
-
-
-    y_indices = (
-        np.arange(new_height)
-        * source_height
-        // new_height
-    )
-
-
-    x_indices = (
-        np.arange(new_width)
-        * source_width
-        // new_width
-    )
-
-
-    return image[
-        y_indices[:, None],
-        x_indices[None, :],
-        :
-    ]
-
-
-# ============================================================
-# FRAME -> 64x54 RGB
+# CAPTURE -> 128x96
 # ============================================================
 
 def frame_to_rgb(frame):
 
     buffer = frame.frame_buffer
 
-
     if buffer is None:
         return None
 
+    if not isinstance(buffer, np.ndarray):
 
-    if not isinstance(
-        buffer,
-        np.ndarray
-    ):
-
-        buffer = np.asarray(
-            buffer
-        )
-
+        buffer = np.asarray(buffer)
 
     if buffer.ndim != 3:
-        return None
 
+        print(
+            "[PYTHON] Invalid frame:",
+            buffer.shape
+        )
+
+        return None
 
     if buffer.shape[2] < 3:
+
+        print(
+            "[PYTHON] Not enough color channels:",
+            buffer.shape
+        )
+
         return None
 
-
-    capture_height = buffer.shape[0]
-    capture_width = buffer.shape[1]
-
+    source_height = buffer.shape[0]
+    source_width = buffer.shape[1]
 
     if (
-        capture_width <= 0
+        source_width < OUTPUT_WIDTH
         or
-        capture_height <= 0
+        source_height < OUTPUT_HEIGHT
     ):
+
+        print(
+            "[PYTHON] Capture too small:",
+            f"{source_width}x{source_height}"
+        )
 
         return None
 
-
     # ========================================================
-    # DETECT ACTUAL CAPTURE SIZE
-    # ========================================================
-
-    target_aspect = 4.0 / 3.0
-
-    capture_aspect = (
-        capture_width /
-        capture_height
-    )
-
-
-    # ========================================================
-    # FIND LARGEST CENTERED 4:3 AREA
+    # MATHEMATICAL RESIZE
+    #
+    # The Snes9x capture is approximately 600x500.
+    #
+    # We preserve the complete captured image and map it
+    # mathematically into 128x96.
     # ========================================================
 
-    if capture_aspect > target_aspect:
-
-        crop_height = capture_height
-
-        crop_width = int(
-            round(
-                crop_height *
-                target_aspect
-            )
+    x_positions = (
+        (
+            np.arange(OUTPUT_WIDTH) + 0.5
         )
+        *
+        source_width
+        /
+        OUTPUT_WIDTH
+    ).astype(np.int32)
 
-    else:
-
-        crop_width = capture_width
-
-        crop_height = int(
-            round(
-                crop_width /
-                target_aspect
-            )
+    y_positions = (
+        (
+            np.arange(OUTPUT_HEIGHT) + 0.5
         )
+        *
+        source_height
+        /
+        OUTPUT_HEIGHT
+    ).astype(np.int32)
 
+    # Prevent possible boundary overflow.
 
-    crop_width = min(
-        crop_width,
-        capture_width
+    x_positions = np.clip(
+        x_positions,
+        0,
+        source_width - 1
     )
 
-    crop_height = min(
-        crop_height,
-        capture_height
+    y_positions = np.clip(
+        y_positions,
+        0,
+        source_height - 1
     )
 
-
     # ========================================================
-    # CENTER CROP
+    # Nearest mathematical sampling.
+    #
+    # No guessed crop dimensions.
     # ========================================================
 
-    left = (
-        capture_width -
-        crop_width
-    ) // 2
-
-
-    top = (
-        capture_height -
-        crop_height
-    ) // 2
-
-
-    cropped = buffer[
-        top:
-        top + crop_height,
-
-        left:
-        left + crop_width,
-
-        :
+    sampled = buffer[
+        y_positions[:, None],
+        x_positions[None, :],
+        :3
     ]
 
-
     # ========================================================
-    # BGRA -> RGB
+    # Windows capture is BGRA.
+    # Convert:
+    #
+    # B G R
+    # ->
+    # R G B
     # ========================================================
 
-    rgb = cropped[
-        :, :, :3
-    ][
+    rgb = sampled[
         :, :, ::-1
-    ]
+    ].copy()
 
-
-    # ========================================================
-    # RESIZE MATHEMATICALLY
-    # ========================================================
-
-    resized = resize_nearest(
-        rgb,
-        WIDTH,
-        HEIGHT
-    )
-
-
-    return resized.copy()
+    return rgb
 
 
 # ============================================================
@@ -364,8 +306,8 @@ def frame_to_rgb(frame):
 def rgb_to_text(rgb):
 
     if rgb.shape != (
-        HEIGHT,
-        WIDTH,
+        OUTPUT_HEIGHT,
+        OUTPUT_WIDTH,
         3
     ):
 
@@ -374,28 +316,22 @@ def rgb_to_text(rgb):
             str(rgb.shape)
         )
 
-
     rgb = np.asarray(
         rgb,
         dtype=np.uint8
     )
-
 
     flat = rgb.reshape(
         -1,
         3
     )
 
-
     lines = [
         f"{int(r)},{int(g)},{int(b)}"
         for r, g, b in flat
     ]
 
-
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -434,21 +370,16 @@ def on_frame_arrived(
         if capture_closed:
             return
 
-
         rgb = frame_to_rgb(frame)
-
 
         if rgb is None:
             return
 
-
         rgb_text = rgb_to_text(rgb)
-
 
         write_rgb_to_modfs(
             rgb_text
         )
-
 
     except Exception as error:
 
@@ -459,7 +390,7 @@ def on_frame_arrived(
 
 
 # ============================================================
-# CLOSED
+# CAPTURE CLOSED
 # ============================================================
 
 @capture.event
@@ -484,32 +415,22 @@ def main():
 
     capture_closed = False
 
-
     print(
-        "[PYTHON] ================================================"
+        "=================================================="
     )
 
     print(
-        "[PYTHON] Snes9x -> 64x54 framebuffer"
+        "[PYTHON] Snes9x 128x96 framebuffer"
     )
 
     print(
-        "[PYTHON] ================================================"
+        "[PYTHON] Capture:",
+        f"{CAPTURE_WIDTH}x{CAPTURE_HEIGHT}"
     )
 
     print(
-        "[PYTHON] Window:",
-        WINDOW_NAME
-    )
-
-    print(
-        "[PYTHON] Resolution:",
-        f"{WIDTH}x{HEIGHT}"
-    )
-
-    print(
-        "[PYTHON] RGB bytes:",
-        WIDTH * HEIGHT * 3
+        "[PYTHON] Output:",
+        f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}"
     )
 
     print(
@@ -517,9 +438,11 @@ def main():
         MODFS_PATH
     )
 
+    print(
+        "=================================================="
+    )
 
     ensure_modfs()
-
 
     try:
 
@@ -534,6 +457,14 @@ def main():
 
         return
 
+    print(
+        "[PYTHON] Capture session ended."
+    )
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
