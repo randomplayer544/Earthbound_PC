@@ -1,10 +1,8 @@
 import os
-import time
 import zipfile
 import threading
 
 import numpy as np
-from PIL import Image
 
 from windows_capture import (
     WindowsCapture,
@@ -19,27 +17,21 @@ from windows_capture import (
 
 WINDOW_NAME = "Snes9x"
 
-# Actual framebuffer sent to SM64CoopDX
-SOURCE_WIDTH = 256
+# Final framebuffer
+SOURCE_WIDTH = 301
 SOURCE_HEIGHT = 224
 
-# Actual Snes9x capture size
+# Snes9x capture
 CAPTURE_WIDTH = 600
 CAPTURE_HEIGHT = 500
 
-# Snes9x is displaying the 256x224 image at 2x.
-GAME_CAPTURE_WIDTH = 512
-GAME_CAPTURE_HEIGHT = 448
+# Actual 2x SNES image
+GAME_WIDTH = 512
+GAME_HEIGHT = 448
 
-# ============================================================
-# MODFS PATH
-#
-# IMPORTANT:
-# No "\save\" folder.
-# ============================================================
-
+# ModFS
 MODFS_PATH = os.path.expandvars(
-    r"%APPDATA%\sm64coopdx\sav\Earthbound.modfs"
+    r"%APPDATA%\sm64coopdx\sav\earthbound.modfs"
 )
 
 RGB_FILENAME = "rgb.txt"
@@ -57,7 +49,7 @@ write_lock = threading.Lock()
 
 last_rgb_text = None
 
-last_dimensions_printed = False
+printed_capture_size = False
 
 
 # ============================================================
@@ -74,10 +66,6 @@ def ensure_modfs():
         directory,
         exist_ok=True
     )
-
-    # ========================================================
-    # Create the .modfs as a REAL ZIP if it doesn't exist.
-    # ========================================================
 
     if not os.path.exists(MODFS_PATH):
 
@@ -97,16 +85,8 @@ def ensure_modfs():
                 ""
             )
 
-        print(
-            "[PYTHON] Earthbound.modfs created."
-        )
-
         return
 
-
-    # ========================================================
-    # Verify existing .modfs is actually a ZIP.
-    # ========================================================
 
     if not zipfile.is_zipfile(MODFS_PATH):
 
@@ -115,20 +95,10 @@ def ensure_modfs():
             "is not a valid ZIP."
         )
 
-        print(
-            "[PYTHON] Recreating it..."
-        )
-
         try:
-
-            os.remove(
-                MODFS_PATH
-            )
-
+            os.remove(MODFS_PATH)
         except OSError:
-
             pass
-
 
         with zipfile.ZipFile(
             MODFS_PATH,
@@ -140,7 +110,6 @@ def ensure_modfs():
                 RGB_FILENAME,
                 ""
             )
-
 
         print(
             "[PYTHON] Valid Earthbound.modfs created."
@@ -155,13 +124,8 @@ def write_rgb_to_modfs(rgb_text):
 
     global last_rgb_text
 
-    # ========================================================
-    # Don't rewrite the ZIP if nothing changed.
-    # ========================================================
-
     if rgb_text == last_rgb_text:
         return
-
 
     with write_lock:
 
@@ -169,11 +133,6 @@ def write_rgb_to_modfs(rgb_text):
             MODFS_PATH +
             ".tmp"
         )
-
-
-        # ====================================================
-        # Preserve every existing file except rgb.txt.
-        # ====================================================
 
         old_files = {}
 
@@ -198,7 +157,6 @@ def write_rgb_to_modfs(rgb_text):
                         info.filename
                     )
 
-
         except (
             zipfile.BadZipFile,
             FileNotFoundError
@@ -207,17 +165,11 @@ def write_rgb_to_modfs(rgb_text):
             old_files = {}
 
 
-        # ====================================================
-        # Build a completely new valid ZIP.
-        # ====================================================
-
         with zipfile.ZipFile(
             temp_path,
             "w",
             compression=zipfile.ZIP_DEFLATED
         ) as new_zip:
-
-            # Preserve other mod files.
 
             for filename, content in old_files.items():
 
@@ -226,83 +178,66 @@ def write_rgb_to_modfs(rgb_text):
                     content
                 )
 
-
-            # Add framebuffer.
-
             new_zip.writestr(
                 RGB_FILENAME,
                 rgb_text
             )
 
 
-        # ====================================================
-        # Replace old ZIP atomically.
-        # ====================================================
-
         os.replace(
             temp_path,
             MODFS_PATH
         )
 
-
         last_rgb_text = rgb_text
 
 
 # ============================================================
-# CONVERT FRAME
+# RESIZE WIDTH ONLY
+# ============================================================
+
+def resize_width_nearest(image, new_width):
+
+    """
+    Resize only the horizontal dimension.
+
+    Input:
+        512x448
+
+    Output:
+        301x448
+
+    Height is untouched.
+    """
+
+    old_height = image.shape[0]
+    old_width = image.shape[1]
+
+    x_indices = (
+        np.arange(new_width)
+        * old_width
+        // new_width
+    )
+
+    return image[
+        :,
+        x_indices,
+        :
+    ]
+
+
+# ============================================================
+# CONVERT CAPTURE TO 301x224 RGB
 # ============================================================
 
 def frame_to_rgb(frame):
 
-    """
-    Snes9x capture:
-
-        600x500
-
-    Actual game image:
-
-        512x448
-
-    Which is:
-
-        256x224 at 2x
-
-    Pipeline:
-
-        600x500
-             |
-             v
-        centered 512x448
-             |
-             v
-        256x224
-             |
-             v
-        RGB framebuffer
-    """
-
-    global last_dimensions_printed
-
-
-    # ========================================================
-    # Get capture buffer.
-    # ========================================================
+    global printed_capture_size
 
     buffer = frame.frame_buffer
 
-
     if buffer is None:
-
-        print(
-            "[PYTHON] Frame buffer is None."
-        )
-
         return None
-
-
-    # ========================================================
-    # Make sure it is NumPy.
-    # ========================================================
 
     if not isinstance(
         buffer,
@@ -313,10 +248,6 @@ def frame_to_rgb(frame):
             buffer
         )
 
-
-    # ========================================================
-    # Validate dimensions.
-    # ========================================================
 
     if buffer.ndim != 3:
 
@@ -342,218 +273,122 @@ def frame_to_rgb(frame):
     capture_width = buffer.shape[1]
 
 
-    # ========================================================
-    # Print capture dimensions once.
-    # ========================================================
-
-    if not last_dimensions_printed:
+    if not printed_capture_size:
 
         print(
-            "[PYTHON] Capture dimensions:",
+            "[PYTHON] Capture size:",
             f"{capture_width}x{capture_height}"
         )
 
-        last_dimensions_printed = True
+        print(
+            "[PYTHON] Game area:",
+            f"{GAME_WIDTH}x{GAME_HEIGHT}"
+        )
+
+        print(
+            "[PYTHON] Final framebuffer:",
+            f"{SOURCE_WIDTH}x{SOURCE_HEIGHT}"
+        )
+
+        printed_capture_size = True
 
 
     # ========================================================
-    # Require the expected 600x500 capture.
+    # CENTER CROP 512x448 FROM 600x500
     # ========================================================
 
     if (
-        capture_width != CAPTURE_WIDTH
+        capture_width < GAME_WIDTH
         or
-        capture_height != CAPTURE_HEIGHT
+        capture_height < GAME_HEIGHT
     ):
 
         print(
-            "[PYTHON] Unexpected capture size:",
-            f"{capture_width}x{capture_height}",
-            "expected",
-            f"{CAPTURE_WIDTH}x{CAPTURE_HEIGHT}"
+            "[PYTHON] Capture too small:",
+            f"{capture_width}x{capture_height}"
         )
 
         return None
 
-
-    # ========================================================
-    # Determine where the 512x448 game image is.
-    #
-    # 600 - 512 = 88
-    # 88 / 2 = 44
-    #
-    # 500 - 448 = 52
-    # 52 / 2 = 26
-    #
-    # Therefore:
-    #
-    # left = 44
-    # top  = 26
-    # ========================================================
 
     left = (
         capture_width -
-        GAME_CAPTURE_WIDTH
+        GAME_WIDTH
     ) // 2
-
 
     top = (
         capture_height -
-        GAME_CAPTURE_HEIGHT
+        GAME_HEIGHT
     ) // 2
 
 
-    right = (
-        left +
-        GAME_CAPTURE_WIDTH
-    )
-
-
-    bottom = (
-        top +
-        GAME_CAPTURE_HEIGHT
-    )
-
-
-    # ========================================================
-    # Safety check.
-    # ========================================================
-
-    if (
-        left < 0
-        or
-        top < 0
-        or
-        right > capture_width
-        or
-        bottom > capture_height
-    ):
-
-        print(
-            "[PYTHON] Game area does not fit inside capture."
-        )
-
-        print(
-            "[PYTHON] Capture:",
-            f"{capture_width}x{capture_height}"
-        )
-
-        print(
-            "[PYTHON] Game:",
-            f"{GAME_CAPTURE_WIDTH}x{GAME_CAPTURE_HEIGHT}"
-        )
-
-        return None
-
-
-    # ========================================================
-    # Extract COMPLETE 512x448 game image.
-    # ========================================================
-
     game = buffer[
-        top:bottom,
-        left:right,
+        top:
+        top + GAME_HEIGHT,
+
+        left:
+        left + GAME_WIDTH,
+
         :
     ]
 
 
     # ========================================================
-    # Validate extracted image.
-    # ========================================================
-
-    if game.shape[0] != GAME_CAPTURE_HEIGHT:
-
-        print(
-            "[PYTHON] Wrong extracted height:",
-            game.shape
-        )
-
-        return None
-
-
-    if game.shape[1] != GAME_CAPTURE_WIDTH:
-
-        print(
-            "[PYTHON] Wrong extracted width:",
-            game.shape
-        )
-
-        return None
-
-
-    # ========================================================
-    # Windows Capture normally provides BGRA.
-    #
-    # Convert:
-    #
-    # BGRA
-    #   ↓
-    # RGB
+    # BGRA -> RGB
     # ========================================================
 
     game_rgb = game[
         :, :, :3
     ][
         :, :, ::-1
-    ].copy()
+    ]
 
 
     # ========================================================
-    # Convert NumPy array to PIL image.
+    # REDUCE HEIGHT 448 -> 224
+    #
+    # This is an exact 2x reduction vertically.
     # ========================================================
 
-    image = Image.fromarray(
+    game_rgb = game_rgb[
+        0::2,
+        :,
+        :
+    ]
+
+
+    # ========================================================
+    # RESIZE WIDTH 512 -> 301
+    #
+    # Height remains exactly 224.
+    #
+    # Nearest-neighbor is used so there is no interpolation
+    # blur introduced into the framebuffer.
+    # ========================================================
+
+    rgb = resize_width_nearest(
         game_rgb,
-        "RGB"
-    )
+        SOURCE_WIDTH
+    ).copy()
 
 
     # ========================================================
-    # Reduce:
-    #
-    # 512x448
-    #
-    # to:
-    #
-    # 256x224
-    #
-    # NEAREST is intentional.
-    #
-    # Every 2x2 source block becomes exactly one SNES pixel.
+    # FINAL VALIDATION
     # ========================================================
 
-    image = image.resize(
-        (
-            SOURCE_WIDTH,
-            SOURCE_HEIGHT
-        ),
-        Image.Resampling.NEAREST
-    )
-
-
-    # ========================================================
-    # PIL -> NumPy.
-    # ========================================================
-
-    rgb = np.asarray(
-        image,
-        dtype=np.uint8
-    )
-
-
-    # ========================================================
-    # Final shape check.
-    # ========================================================
-
-    if rgb.shape != (
+    expected_shape = (
         SOURCE_HEIGHT,
         SOURCE_WIDTH,
         3
-    ):
+    )
+
+    if rgb.shape != expected_shape:
 
         print(
-            "[PYTHON] Resize produced wrong shape:",
-            rgb.shape
+            "[PYTHON] Wrong final RGB shape:",
+            rgb.shape,
+            "expected:",
+            expected_shape
         )
 
         return None
@@ -563,20 +398,18 @@ def frame_to_rgb(frame):
 
 
 # ============================================================
-# RGB NUMPY ARRAY -> rgb.txt
+# RGB -> TEXT
 # ============================================================
 
 def rgb_to_text(rgb):
 
-    # ========================================================
-    # Verify exact framebuffer size.
-    # ========================================================
-
-    if rgb.shape != (
+    expected_shape = (
         SOURCE_HEIGHT,
         SOURCE_WIDTH,
         3
-    ):
+    )
+
+    if rgb.shape != expected_shape:
 
         raise ValueError(
             "Unexpected RGB shape: " +
@@ -584,26 +417,11 @@ def rgb_to_text(rgb):
         )
 
 
-    # ========================================================
-    # Ensure uint8.
-    # ========================================================
-
     rgb = np.asarray(
         rgb,
         dtype=np.uint8
     )
 
-
-    # ========================================================
-    # Flatten:
-    #
-    # row 1
-    # row 2
-    # ...
-    # row 224
-    #
-    # Every row contains 256 pixels.
-    # ========================================================
 
     flat = rgb.reshape(
         -1,
@@ -611,17 +429,12 @@ def rgb_to_text(rgb):
     )
 
 
-    # ========================================================
-    # Convert every pixel to:
-    #
-    # R,G,B
-    #
-    # Exactly 57344 lines.
-    # ========================================================
-
     lines = [
+
         f"{int(r)},{int(g)},{int(b)}"
+
         for r, g, b in flat
+
     ]
 
 
@@ -631,7 +444,7 @@ def rgb_to_text(rgb):
 
 
 # ============================================================
-# FRAME CAPTURE
+# CAPTURE
 # ============================================================
 
 capture = WindowsCapture(
@@ -640,18 +453,12 @@ capture = WindowsCapture(
 
     draw_border=False,
 
-    # ========================================================
-    # Capture the Snes9x window.
-    #
-    # No win32gui is required.
-    # ========================================================
-
     window_name=WINDOW_NAME,
 
     monitor_index=None,
 
     minimum_update_interval=
-        MINIMUM_UPDATE_INTERVAL
+        MINIMUM_UPDATE_INTERVAL,
 )
 
 
@@ -670,36 +477,21 @@ def on_frame_arrived(
     try:
 
         if capture_closed:
-
             return
 
-
-        # ====================================================
-        # Convert 600x500 capture into 256x224 framebuffer.
-        # ====================================================
 
         rgb = frame_to_rgb(
             frame
         )
 
-
         if rgb is None:
-
             return
 
-
-        # ====================================================
-        # Convert framebuffer to text.
-        # ====================================================
 
         rgb_text = rgb_to_text(
             rgb
         )
 
-
-        # ====================================================
-        # Write framebuffer to ModFS.
-        # ====================================================
 
         write_rgb_to_modfs(
             rgb_text
@@ -742,32 +534,20 @@ def on_closed():
 def main():
 
     global capture_closed
-    global last_dimensions_printed
-    global last_rgb_text
-
 
     capture_closed = False
 
-    last_dimensions_printed = False
-
-    last_rgb_text = None
-
 
     print(
-        "[PYTHON] =================================================="
+        "[PYTHON] ================================================"
     )
 
     print(
-        "[PYTHON] Snes9x RGB framebuffer capture"
+        "[PYTHON] Snes9x 301x224 RGB framebuffer"
     )
 
     print(
-        "[PYTHON] =================================================="
-    )
-
-    print(
-        "[PYTHON] Window:",
-        WINDOW_NAME
+        "[PYTHON] ================================================"
     )
 
     print(
@@ -776,12 +556,12 @@ def main():
     )
 
     print(
-        "[PYTHON] Game area:",
-        f"{GAME_CAPTURE_WIDTH}x{GAME_CAPTURE_HEIGHT}"
+        "[PYTHON] Game:",
+        f"{GAME_WIDTH}x{GAME_HEIGHT}"
     )
 
     print(
-        "[PYTHON] Output framebuffer:",
+        "[PYTHON] Output:",
         f"{SOURCE_WIDTH}x{SOURCE_HEIGHT}"
     )
 
@@ -791,21 +571,12 @@ def main():
     )
 
 
-    # ========================================================
-    # Ensure Earthbound.modfs exists.
-    # ========================================================
-
     ensure_modfs()
 
-
-    # ========================================================
-    # Start capture.
-    # ========================================================
 
     try:
 
         capture.start()
-
 
     except Exception as error:
 
