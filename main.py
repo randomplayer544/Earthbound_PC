@@ -15,16 +15,14 @@ from windows_capture import (
 
 WINDOW_NAME = "Snes9x"
 
-# Output framebuffer
-OUTPUT_WIDTH = 128
-OUTPUT_HEIGHT = 96
+SOURCE_WIDTH = 160
+SOURCE_HEIGHT = 120
 
-# Expected Snes9x capture
 CAPTURE_WIDTH = 600
 CAPTURE_HEIGHT = 500
 
 MODFS_PATH = os.path.expandvars(
-    r"%APPDATA%\sm64coopdx\sav\Earthbound.modfs"
+    r"%APPDATA%\sm64coopdx\sav\earthbound.modfs"
 )
 
 RGB_FILENAME = "rgb.txt"
@@ -55,10 +53,7 @@ def ensure_modfs():
 
     if not os.path.exists(MODFS_PATH):
 
-        print(
-            "[PYTHON] Creating:",
-            MODFS_PATH
-        )
+        print("[PYTHON] Creating:", MODFS_PATH)
 
         with zipfile.ZipFile(
             MODFS_PATH,
@@ -75,9 +70,7 @@ def ensure_modfs():
 
     if not zipfile.is_zipfile(MODFS_PATH):
 
-        print(
-            "[PYTHON] Earthbound.modfs is not a valid ZIP."
-        )
+        print("[PYTHON] Invalid modfs. Recreating.")
 
         try:
             os.remove(MODFS_PATH)
@@ -95,13 +88,9 @@ def ensure_modfs():
                 ""
             )
 
-        print(
-            "[PYTHON] Recreated valid Earthbound.modfs."
-        )
-
 
 # ============================================================
-# WRITE RGB.TXT
+# WRITE RGB
 # ============================================================
 
 def write_rgb_to_modfs(rgb_text):
@@ -132,10 +121,8 @@ def write_rgb_to_modfs(rgb_text):
                     if info.is_dir():
                         continue
 
-                    old_files[
-                        info.filename
-                    ] = old_zip.read(
-                        info.filename
+                    old_files[info.filename] = (
+                        old_zip.read(info.filename)
                     )
 
         except (
@@ -144,10 +131,6 @@ def write_rgb_to_modfs(rgb_text):
         ):
 
             old_files = {}
-
-        # ----------------------------------------------------
-        # Build completely new ZIP.
-        # ----------------------------------------------------
 
         with zipfile.ZipFile(
             temp_path,
@@ -167,10 +150,6 @@ def write_rgb_to_modfs(rgb_text):
                 rgb_text
             )
 
-        # ----------------------------------------------------
-        # Atomic replacement.
-        # ----------------------------------------------------
-
         os.replace(
             temp_path,
             MODFS_PATH
@@ -180,7 +159,68 @@ def write_rgb_to_modfs(rgb_text):
 
 
 # ============================================================
-# CAPTURE -> 128x96
+# RESIZE 600x500 -> 160x120
+#
+# Uses mathematical nearest-neighbour sampling.
+#
+# The entire captured Snes9x window is used.
+# ============================================================
+
+def resize_frame(rgb):
+
+    source_h, source_w = rgb.shape[:2]
+
+    if source_w != CAPTURE_WIDTH or source_h != CAPTURE_HEIGHT:
+
+        print(
+            "[PYTHON] Capture dimensions:",
+            f"{source_w}x{source_h}"
+        )
+
+    # Mathematical sampling positions.
+    #
+    # This does not guess a crop.
+    # It samples the complete captured window.
+
+    x_indices = (
+        np.floor(
+            np.arange(SOURCE_WIDTH)
+            * source_w
+            / SOURCE_WIDTH
+        ).astype(np.int32)
+    )
+
+    y_indices = (
+        np.floor(
+            np.arange(SOURCE_HEIGHT)
+            * source_h
+            / SOURCE_HEIGHT
+        ).astype(np.int32)
+    )
+
+    x_indices = np.clip(
+        x_indices,
+        0,
+        source_w - 1
+    )
+
+    y_indices = np.clip(
+        y_indices,
+        0,
+        source_h - 1
+    )
+
+    resized = rgb[
+        y_indices[:, None],
+        x_indices[None, :],
+        :
+    ]
+
+    return resized.copy()
+
+
+# ============================================================
+# FRAME -> RGB
 # ============================================================
 
 def frame_to_rgb(frame):
@@ -195,106 +235,30 @@ def frame_to_rgb(frame):
         buffer = np.asarray(buffer)
 
     if buffer.ndim != 3:
-
-        print(
-            "[PYTHON] Invalid frame:",
-            buffer.shape
-        )
-
         return None
 
     if buffer.shape[2] < 3:
-
-        print(
-            "[PYTHON] Not enough color channels:",
-            buffer.shape
-        )
-
         return None
 
     source_height = buffer.shape[0]
     source_width = buffer.shape[1]
 
     if (
-        source_width < OUTPUT_WIDTH
+        source_width < 1
         or
-        source_height < OUTPUT_HEIGHT
+        source_height < 1
     ):
-
-        print(
-            "[PYTHON] Capture too small:",
-            f"{source_width}x{source_height}"
-        )
-
         return None
 
-    # ========================================================
-    # MATHEMATICAL RESIZE
-    #
-    # The Snes9x capture is approximately 600x500.
-    #
-    # We preserve the complete captured image and map it
-    # mathematically into 128x96.
-    # ========================================================
-
-    x_positions = (
-        (
-            np.arange(OUTPUT_WIDTH) + 0.5
-        )
-        *
-        source_width
-        /
-        OUTPUT_WIDTH
-    ).astype(np.int32)
-
-    y_positions = (
-        (
-            np.arange(OUTPUT_HEIGHT) + 0.5
-        )
-        *
-        source_height
-        /
-        OUTPUT_HEIGHT
-    ).astype(np.int32)
-
-    # Prevent possible boundary overflow.
-
-    x_positions = np.clip(
-        x_positions,
-        0,
-        source_width - 1
-    )
-
-    y_positions = np.clip(
-        y_positions,
-        0,
-        source_height - 1
-    )
-
-    # ========================================================
-    # Nearest mathematical sampling.
-    #
-    # No guessed crop dimensions.
-    # ========================================================
-
-    sampled = buffer[
-        y_positions[:, None],
-        x_positions[None, :],
-        :3
-    ]
-
-    # ========================================================
     # Windows capture is BGRA.
-    # Convert:
-    #
-    # B G R
-    # ->
-    # R G B
-    # ========================================================
+    # Convert to RGB.
 
-    rgb = sampled[
-        :, :, ::-1
-    ].copy()
+    rgb = buffer[
+        :, :, :3
+    ][:, :, ::-1]
+
+    # Resize the ENTIRE capture.
+    rgb = resize_frame(rgb)
 
     return rgb
 
@@ -306,14 +270,14 @@ def frame_to_rgb(frame):
 def rgb_to_text(rgb):
 
     if rgb.shape != (
-        OUTPUT_HEIGHT,
-        OUTPUT_WIDTH,
+        SOURCE_HEIGHT,
+        SOURCE_WIDTH,
         3
     ):
 
         raise ValueError(
-            "Unexpected RGB shape: " +
-            str(rgb.shape)
+            "Unexpected RGB shape: "
+            + str(rgb.shape)
         )
 
     rgb = np.asarray(
@@ -390,7 +354,7 @@ def on_frame_arrived(
 
 
 # ============================================================
-# CAPTURE CLOSED
+# CLOSED
 # ============================================================
 
 @capture.event
@@ -416,21 +380,19 @@ def main():
     capture_closed = False
 
     print(
-        "=================================================="
+        "[PYTHON] =========================================="
     )
 
     print(
-        "[PYTHON] Snes9x 128x96 framebuffer"
+        "[PYTHON] Snes9x -> 160x120 RGB framebuffer"
     )
 
     print(
-        "[PYTHON] Capture:",
-        f"{CAPTURE_WIDTH}x{CAPTURE_HEIGHT}"
+        "[PYTHON] Capture: entire 600x500 window"
     )
 
     print(
-        "[PYTHON] Output:",
-        f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}"
+        "[PYTHON] Output: 160x120"
     )
 
     print(
@@ -439,7 +401,7 @@ def main():
     )
 
     print(
-        "=================================================="
+        "[PYTHON] =========================================="
     )
 
     ensure_modfs()
