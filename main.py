@@ -1,602 +1,1198 @@
-import os
-import zipfile
-import threading
-
-import numpy as np
-
-from windows_capture import (
-    WindowsCapture,
-    Frame,
-    InternalCaptureControl,
-)
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-WINDOW_NAME = "Snes9x"
-
-# Final framebuffer
-SOURCE_WIDTH = 301
-SOURCE_HEIGHT = 224
-
-# Snes9x capture
-CAPTURE_WIDTH = 600
-CAPTURE_HEIGHT = 500
-
-# Actual 2x SNES image
-GAME_WIDTH = 512
-GAME_HEIGHT = 448
-
-# ModFS
-MODFS_PATH = os.path.expandvars(
-    r"%APPDATA%\sm64coopdx\sav\earthbound.modfs"
-)
-
-RGB_FILENAME = "rgb.txt"
-
-MINIMUM_UPDATE_INTERVAL = 16
+-- ============================================================
+-- RGB FRAMEBUFFER
+--
+-- Resolution:
+--     320x224
+--
+-- ModFS:
+--     %APPDATA%\sm64coopdx\sav\Earthbound.modfs
+--
+-- File:
+--     rgb.txt
+--
+-- DISPLAY:
+--     Centered
+--     4:3
+--
+-- IMPORTANT:
+--     Last valid frame remains displayed if rgb.txt
+--     temporarily cannot be read.
+--
+-- NETWORK:
+--     HOST reads ModFS
+--     HOST sends framebuffer
+--     CLIENTS reconstruct framebuffer
+--     1024-byte chunks
+-- ============================================================
 
 
-# ============================================================
-# STATE
-# ============================================================
+local WIDTH = 320
+local HEIGHT = 224
 
-capture_closed = False
+local TOTAL_PIXELS =
+    WIDTH * HEIGHT
 
-write_lock = threading.Lock()
-
-last_rgb_text = None
-
-printed_capture_size = False
+local RGB_BYTES =
+    TOTAL_PIXELS * 3
 
 
-# ============================================================
-# CREATE / VERIFY MODFS
-# ============================================================
+-- ============================================================
+-- NETWORK
+-- ============================================================
 
-def ensure_modfs():
+local PACKET_ID = 0x52
 
-    directory = os.path.dirname(
-        MODFS_PATH
+local PACKET_START = 0x01
+local PACKET_DATA  = 0x02
+local PACKET_END   = 0x03
+
+local CHUNK_SIZE = 1024
+
+local TOTAL_CHUNKS =
+    math.ceil(
+        RGB_BYTES / CHUNK_SIZE
     )
 
-    os.makedirs(
-        directory,
-        exist_ok=True
-    )
 
-    if not os.path.exists(MODFS_PATH):
+-- ============================================================
+-- DISPLAY
+-- ============================================================
+
+local FRAME_ASPECT = 4 / 3
+
+
+-- ============================================================
+-- FRAMEBUFFER
+-- ============================================================
+
+local pixels = {}
+
+local framebuffer_loaded = false
+
+local last_rgb = ""
+
+
+-- ============================================================
+-- NETWORK RECEIVE
+-- ============================================================
+
+local receiving_frame = false
+
+local receiving_frame_id = 0
+
+local receiving_total_chunks = 0
+
+local received_chunks = {}
+
+local received_chunk_count = 0
+
+
+-- ============================================================
+-- HOST SEND
+-- ============================================================
+
+local sending_frame = false
+
+local sending_frame_id = 0
+
+local sending_chunk = 1
+
+local sending_data = nil
+
+
+-- ============================================================
+-- BLACK FRAME
+-- ============================================================
+
+local function create_black_frame()
+
+    pixels = {}
+
+    for y = 1, HEIGHT do
+
+        pixels[y] = {}
+
+        for x = 1, WIDTH do
+
+            pixels[y][x] = {
+                r = 0,
+                g = 0,
+                b = 0
+            }
+
+        end
+
+    end
+
+end
+
+
+-- ============================================================
+-- BINARY RGB -> FRAMEBUFFER
+-- ============================================================
+
+local function rgb_string_to_framebuffer(data)
+
+    if not data then
+        return false
+    end
+
+
+    if #data ~= RGB_BYTES then
 
         print(
-            "[PYTHON] Creating:",
-            MODFS_PATH
+            "[RGB] Bad network frame size: " ..
+            tostring(#data) ..
+            "/" ..
+            tostring(RGB_BYTES)
         )
 
-        with zipfile.ZipFile(
-            MODFS_PATH,
-            "w",
-            compression=zipfile.ZIP_DEFLATED
-        ) as z:
+        return false
 
-            z.writestr(
-                RGB_FILENAME,
-                ""
-            )
-
-        return
+    end
 
 
-    if not zipfile.is_zipfile(MODFS_PATH):
+    local new_pixels = {}
 
-        print(
-            "[PYTHON] Existing Earthbound.modfs "
-            "is not a valid ZIP."
-        )
-
-        try:
-            os.remove(MODFS_PATH)
-        except OSError:
-            pass
-
-        with zipfile.ZipFile(
-            MODFS_PATH,
-            "w",
-            compression=zipfile.ZIP_DEFLATED
-        ) as z:
-
-            z.writestr(
-                RGB_FILENAME,
-                ""
-            )
-
-        print(
-            "[PYTHON] Valid Earthbound.modfs created."
-        )
+    for y = 1, HEIGHT do
+        new_pixels[y] = {}
+    end
 
 
-# ============================================================
-# WRITE RGB.TXT INTO MODFS
-# ============================================================
-
-def write_rgb_to_modfs(rgb_text):
-
-    global last_rgb_text
-
-    if rgb_text == last_rgb_text:
-        return
-
-    with write_lock:
-
-        temp_path = (
-            MODFS_PATH +
-            ".tmp"
-        )
-
-        old_files = {}
-
-        try:
-
-            with zipfile.ZipFile(
-                MODFS_PATH,
-                "r"
-            ) as old_zip:
-
-                for info in old_zip.infolist():
-
-                    if info.filename == RGB_FILENAME:
-                        continue
-
-                    if info.is_dir():
-                        continue
-
-                    old_files[
-                        info.filename
-                    ] = old_zip.read(
-                        info.filename
-                    )
-
-        except (
-            zipfile.BadZipFile,
-            FileNotFoundError
-        ):
-
-            old_files = {}
+    local index = 1
 
 
-        with zipfile.ZipFile(
-            temp_path,
-            "w",
-            compression=zipfile.ZIP_DEFLATED
-        ) as new_zip:
+    for y = 1, HEIGHT do
 
-            for filename, content in old_files.items():
+        for x = 1, WIDTH do
 
-                new_zip.writestr(
-                    filename,
-                    content
+            local r =
+                string.byte(
+                    data,
+                    index
                 )
 
-            new_zip.writestr(
-                RGB_FILENAME,
-                rgb_text
+            local g =
+                string.byte(
+                    data,
+                    index + 1
+                )
+
+            local b =
+                string.byte(
+                    data,
+                    index + 2
+                )
+
+
+            if not r
+                or not g
+                or not b
+            then
+
+                return false
+
+            end
+
+
+            new_pixels[y][x] = {
+                r = r,
+                g = g,
+                b = b
+            }
+
+
+            index =
+                index + 3
+
+        end
+
+    end
+
+
+    -- ========================================================
+    -- Atomic replacement.
+    -- ========================================================
+
+    pixels =
+        new_pixels
+
+    framebuffer_loaded =
+        true
+
+
+    return true
+
+end
+
+
+-- ============================================================
+-- FRAMEBUFFER -> BINARY RGB
+-- ============================================================
+
+local function framebuffer_to_rgb_string()
+
+    local output = {}
+
+    local output_index = 1
+
+
+    for y = 1, HEIGHT do
+
+        local row =
+            pixels[y]
+
+
+        for x = 1, WIDTH do
+
+            local pixel =
+                row[x]
+
+
+            output[output_index] =
+                string.char(
+                    pixel.r,
+                    pixel.g,
+                    pixel.b
+                )
+
+
+            output_index =
+                output_index + 1
+
+        end
+
+    end
+
+
+    return table.concat(
+        output
+    )
+
+end
+
+
+-- ============================================================
+-- LOAD RGB.TXT
+-- ============================================================
+
+local function load_rgb()
+
+    mod_fs_reload()
+
+
+    local modFs =
+        mod_fs_get()
+
+
+    -- ========================================================
+    -- IMPORTANT:
+    --
+    -- Failure does NOT erase the existing framebuffer.
+    -- ========================================================
+
+    if not modFs then
+        return false
+    end
+
+
+    local file =
+        modFs:get_file(
+            "rgb.txt"
+        )
+
+
+    if not file then
+        return false
+    end
+
+
+    file:set_text_mode(true)
+
+    file:rewind()
+
+
+    local data =
+        file:read_string()
+
+
+    if not data
+        or
+        data == ""
+    then
+
+        return false
+
+    end
+
+
+    -- ========================================================
+    -- Nothing changed.
+    -- ========================================================
+
+    if data == last_rgb then
+        return true
+    end
+
+
+    -- ========================================================
+    -- Parse frame.
+    -- ========================================================
+
+    local new_pixels = {}
+
+    for y = 1, HEIGHT do
+        new_pixels[y] = {}
+    end
+
+
+    local index = 1
+
+
+    for line in data:gmatch(
+        "[^\r\n]+"
+    ) do
+
+        local r, g, b =
+            line:match(
+                "^%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)%s*$"
             )
 
 
-        os.replace(
-            temp_path,
-            MODFS_PATH
+        if r and g and b then
+
+            if index > TOTAL_PIXELS then
+                break
+            end
+
+
+            local zero_index =
+                index - 1
+
+
+            local x =
+                (zero_index % WIDTH) + 1
+
+
+            local y =
+                math.floor(
+                    zero_index / WIDTH
+                ) + 1
+
+
+            new_pixels[y][x] = {
+                r = tonumber(r),
+                g = tonumber(g),
+                b = tonumber(b)
+            }
+
+
+            index =
+                index + 1
+
+        end
+
+    end
+
+
+    local count =
+        index - 1
+
+
+    -- ========================================================
+    -- Never apply a partial frame.
+    -- ========================================================
+
+    if count ~= TOTAL_PIXELS then
+
+        print(
+            "[RGB] Invalid frame: " ..
+            tostring(count) ..
+            "/" ..
+            tostring(TOTAL_PIXELS)
         )
 
-        last_rgb_text = rgb_text
+        return false
+
+    end
 
 
-# ============================================================
-# RESIZE WIDTH ONLY
-# ============================================================
+    -- ========================================================
+    -- Apply complete frame.
+    -- ========================================================
 
-def resize_width_nearest(image, new_width):
+    pixels =
+        new_pixels
 
-    """
-    Resize only the horizontal dimension.
+    last_rgb =
+        data
 
-    Input:
-        512x448
+    framebuffer_loaded =
+        true
 
-    Output:
-        301x448
 
-    Height is untouched.
-    """
+    -- ========================================================
+    -- HOST NETWORK TRANSMISSION
+    -- ========================================================
 
-    old_height = image.shape[0]
-    old_width = image.shape[1]
+    if network_is_server() then
 
-    x_indices = (
-        np.arange(new_width)
-        * old_width
-        // new_width
+        sending_frame_id =
+            (sending_frame_id + 1) %
+            65536
+
+
+        sending_data =
+            framebuffer_to_rgb_string()
+
+
+        sending_chunk =
+            1
+
+
+        sending_frame =
+            true
+
+    end
+
+
+    return true
+
+end
+
+
+-- ============================================================
+-- SEND START
+-- ============================================================
+
+local function send_frame_start()
+
+    local packet =
+        string.pack(
+            "<BBHH",
+            PACKET_ID,
+            PACKET_START,
+            sending_frame_id,
+            TOTAL_CHUNKS
+        )
+
+
+    network_send_bytestring(
+        true,
+        packet
     )
 
-    return image[
-        :,
-        x_indices,
-        :
-    ]
+end
 
 
-# ============================================================
-# CONVERT CAPTURE TO 301x224 RGB
-# ============================================================
+-- ============================================================
+-- SEND CHUNK
+-- ============================================================
 
-def frame_to_rgb(frame):
+local function send_frame_chunk()
 
-    global printed_capture_size
+    if not sending_data then
+        return
+    end
 
-    buffer = frame.frame_buffer
 
-    if buffer is None:
-        return None
+    if sending_chunk > TOTAL_CHUNKS then
+        return
+    end
 
-    if not isinstance(
-        buffer,
-        np.ndarray
-    ):
 
-        buffer = np.asarray(
-            buffer
+    local start_position =
+        ((sending_chunk - 1) *
+        CHUNK_SIZE) + 1
+
+
+    local end_position =
+        math.min(
+            start_position +
+            CHUNK_SIZE - 1,
+            #sending_data
         )
 
 
-    if buffer.ndim != 3:
-
-        print(
-            "[PYTHON] Invalid frame dimensions:",
-            buffer.shape
-        )
-
-        return None
-
-
-    if buffer.shape[2] < 3:
-
-        print(
-            "[PYTHON] Frame has fewer than 3 channels:",
-            buffer.shape
-        )
-
-        return None
-
-
-    capture_height = buffer.shape[0]
-    capture_width = buffer.shape[1]
-
-
-    if not printed_capture_size:
-
-        print(
-            "[PYTHON] Capture size:",
-            f"{capture_width}x{capture_height}"
-        )
-
-        print(
-            "[PYTHON] Game area:",
-            f"{GAME_WIDTH}x{GAME_HEIGHT}"
-        )
-
-        print(
-            "[PYTHON] Final framebuffer:",
-            f"{SOURCE_WIDTH}x{SOURCE_HEIGHT}"
-        )
-
-        printed_capture_size = True
-
-
-    # ========================================================
-    # CENTER CROP 512x448 FROM 600x500
-    # ========================================================
-
-    if (
-        capture_width < GAME_WIDTH
-        or
-        capture_height < GAME_HEIGHT
-    ):
-
-        print(
-            "[PYTHON] Capture too small:",
-            f"{capture_width}x{capture_height}"
-        )
-
-        return None
-
-
-    left = (
-        capture_width -
-        GAME_WIDTH
-    ) // 2
-
-    top = (
-        capture_height -
-        GAME_HEIGHT
-    ) // 2
-
-
-    game = buffer[
-        top:
-        top + GAME_HEIGHT,
-
-        left:
-        left + GAME_WIDTH,
-
-        :
-    ]
-
-
-    # ========================================================
-    # BGRA -> RGB
-    # ========================================================
-
-    game_rgb = game[
-        :, :, :3
-    ][
-        :, :, ::-1
-    ]
-
-
-    # ========================================================
-    # REDUCE HEIGHT 448 -> 224
-    #
-    # This is an exact 2x reduction vertically.
-    # ========================================================
-
-    game_rgb = game_rgb[
-        0::2,
-        :,
-        :
-    ]
-
-
-    # ========================================================
-    # RESIZE WIDTH 512 -> 301
-    #
-    # Height remains exactly 224.
-    #
-    # Nearest-neighbor is used so there is no interpolation
-    # blur introduced into the framebuffer.
-    # ========================================================
-
-    rgb = resize_width_nearest(
-        game_rgb,
-        SOURCE_WIDTH
-    ).copy()
-
-
-    # ========================================================
-    # FINAL VALIDATION
-    # ========================================================
-
-    expected_shape = (
-        SOURCE_HEIGHT,
-        SOURCE_WIDTH,
-        3
-    )
-
-    if rgb.shape != expected_shape:
-
-        print(
-            "[PYTHON] Wrong final RGB shape:",
-            rgb.shape,
-            "expected:",
-            expected_shape
-        )
-
-        return None
-
-
-    return rgb
-
-
-# ============================================================
-# RGB -> TEXT
-# ============================================================
-
-def rgb_to_text(rgb):
-
-    expected_shape = (
-        SOURCE_HEIGHT,
-        SOURCE_WIDTH,
-        3
-    )
-
-    if rgb.shape != expected_shape:
-
-        raise ValueError(
-            "Unexpected RGB shape: " +
-            str(rgb.shape)
+    local chunk =
+        string.sub(
+            sending_data,
+            start_position,
+            end_position
         )
 
 
-    rgb = np.asarray(
-        rgb,
-        dtype=np.uint8
+    local packet =
+        string.pack(
+            "<BBHH",
+            PACKET_ID,
+            PACKET_DATA,
+            sending_frame_id,
+            sending_chunk
+        )
+        ..
+        chunk
+
+
+    network_send_bytestring(
+        true,
+        packet
     )
 
 
-    flat = rgb.reshape(
-        -1,
-        3
+    sending_chunk =
+        sending_chunk + 1
+
+end
+
+
+-- ============================================================
+-- SEND END
+-- ============================================================
+
+local function send_frame_end()
+
+    local packet =
+        string.pack(
+            "<BBH",
+            PACKET_ID,
+            PACKET_END,
+            sending_frame_id
+        )
+
+
+    network_send_bytestring(
+        true,
+        packet
     )
 
-
-    lines = [
-
-        f"{int(r)},{int(g)},{int(b)}"
-
-        for r, g, b in flat
-
-    ]
+end
 
 
-    return "\n".join(
-        lines
-    )
+-- ============================================================
+-- NETWORK RECEIVE
+-- ============================================================
+
+local function on_packet_bytestring_receive(bytestring)
+
+    if not bytestring then
+        return
+    end
 
 
-# ============================================================
-# CAPTURE
-# ============================================================
-
-capture = WindowsCapture(
-
-    cursor_capture=False,
-
-    draw_border=False,
-
-    window_name=WINDOW_NAME,
-
-    monitor_index=None,
-
-    minimum_update_interval=
-        MINIMUM_UPDATE_INTERVAL,
-)
+    if #bytestring < 2 then
+        return
+    end
 
 
-# ============================================================
-# FRAME ARRIVED
-# ============================================================
+    local packet_id,
+          packet_type =
+        string.unpack(
+            "<BB",
+            bytestring,
+            1
+        )
 
-@capture.event
-def on_frame_arrived(
-    frame: Frame,
-    capture_control: InternalCaptureControl
-):
 
-    global capture_closed
+    if packet_id ~= PACKET_ID then
+        return
+    end
 
-    try:
 
-        if capture_closed:
+    -- ========================================================
+    -- START
+    -- ========================================================
+
+    if packet_type == PACKET_START then
+
+        if network_is_server() then
             return
+        end
 
 
-        rgb = frame_to_rgb(
-            frame
-        )
-
-        if rgb is None:
-            return
-
-
-        rgb_text = rgb_to_text(
-            rgb
-        )
+        local frame_id,
+              total_chunks =
+            string.unpack(
+                "<HH",
+                bytestring,
+                3
+            )
 
 
-        write_rgb_to_modfs(
-            rgb_text
-        )
+        receiving_frame =
+            true
 
+        receiving_frame_id =
+            frame_id
 
-    except Exception as error:
+        receiving_total_chunks =
+            total_chunks
 
-        print(
-            "[PYTHON] Frame error:",
-            repr(error)
-        )
+        received_chunks =
+            {}
 
+        received_chunk_count =
+            0
 
-# ============================================================
-# CAPTURE CLOSED
-# ============================================================
-
-@capture.event
-def on_closed():
-
-    global capture_closed
-
-    capture_closed = True
-
-    print(
-        "[PYTHON] Capture closed."
-    )
-
-    print(
-        "[PYTHON] Snes9x window was closed "
-        "or the capture session ended."
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    global capture_closed
-
-    capture_closed = False
-
-
-    print(
-        "[PYTHON] ================================================"
-    )
-
-    print(
-        "[PYTHON] Snes9x 301x224 RGB framebuffer"
-    )
-
-    print(
-        "[PYTHON] ================================================"
-    )
-
-    print(
-        "[PYTHON] Capture:",
-        f"{CAPTURE_WIDTH}x{CAPTURE_HEIGHT}"
-    )
-
-    print(
-        "[PYTHON] Game:",
-        f"{GAME_WIDTH}x{GAME_HEIGHT}"
-    )
-
-    print(
-        "[PYTHON] Output:",
-        f"{SOURCE_WIDTH}x{SOURCE_HEIGHT}"
-    )
-
-    print(
-        "[PYTHON] ModFS:",
-        MODFS_PATH
-    )
-
-
-    ensure_modfs()
-
-
-    try:
-
-        capture.start()
-
-    except Exception as error:
-
-        print(
-            "[PYTHON] Capture error:",
-            repr(error)
-        )
 
         return
 
-
-    print(
-        "[PYTHON] Capture session ended."
-    )
+    end
 
 
-# ============================================================
-# RUN
-# ============================================================
+    -- ========================================================
+    -- DATA
+    -- ========================================================
 
-if __name__ == "__main__":
+    if packet_type == PACKET_DATA then
 
-    main()
+        if network_is_server() then
+            return
+        end
+
+
+        if not receiving_frame then
+            return
+        end
+
+
+        local frame_id,
+              chunk_number,
+              offset
+
+
+        frame_id,
+        chunk_number,
+        offset =
+            string.unpack(
+                "<HH",
+                bytestring,
+                3
+            )
+
+
+        if frame_id ~=
+            receiving_frame_id
+        then
+
+            return
+
+        end
+
+
+        if chunk_number < 1
+            or
+            chunk_number >
+            receiving_total_chunks
+        then
+
+            return
+
+        end
+
+
+        if not received_chunks[
+            chunk_number
+        ]
+        then
+
+            received_chunks[
+                chunk_number
+            ] =
+                string.sub(
+                    bytestring,
+                    offset
+                )
+
+
+            received_chunk_count =
+                received_chunk_count + 1
+
+        end
+
+
+        return
+
+    end
+
+
+    -- ========================================================
+    -- END
+    -- ========================================================
+
+    if packet_type == PACKET_END then
+
+        if network_is_server() then
+            return
+        end
+
+
+        if not receiving_frame then
+            return
+        end
+
+
+        local frame_id =
+            string.unpack(
+                "<H",
+                bytestring,
+                3
+            )
+
+
+        if frame_id ~=
+            receiving_frame_id
+        then
+
+            return
+
+        end
+
+
+        if received_chunk_count ~=
+            receiving_total_chunks
+        then
+
+            print(
+                "[RGB] Network frame incomplete"
+            )
+
+
+            receiving_frame =
+                false
+
+
+            return
+
+        end
+
+
+        local complete_data = {}
+
+
+        for i = 1,
+            receiving_total_chunks
+        do
+
+            if not received_chunks[i] then
+
+                receiving_frame =
+                    false
+
+                return
+
+            end
+
+
+            complete_data[i] =
+                received_chunks[i]
+
+        end
+
+
+        local frame_data =
+            table.concat(
+                complete_data
+            )
+
+
+        if #frame_data ~=
+            RGB_BYTES
+        then
+
+            print(
+                "[RGB] Invalid network framebuffer"
+            )
+
+
+            receiving_frame =
+                false
+
+
+            return
+
+        end
+
+
+        rgb_string_to_framebuffer(
+            frame_data
+        )
+
+
+        receiving_frame =
+            false
+
+
+        received_chunks =
+            {}
+
+        received_chunk_count =
+            0
+
+
+        return
+
+    end
+
+end
+
+
+-- ============================================================
+-- GEOMETRY
+-- ============================================================
+
+local function get_geometry()
+
+    local screen_width =
+        djui_hud_get_screen_width()
+
+
+    local screen_height =
+        djui_hud_get_screen_height()
+
+
+    local draw_width
+    local draw_height
+
+
+    -- ========================================================
+    -- Fit 4:3 into the available screen.
+    -- ========================================================
+
+    if
+        screen_width / screen_height
+        >
+        FRAME_ASPECT
+    then
+
+        draw_height =
+            screen_height
+
+        draw_width =
+            draw_height *
+            FRAME_ASPECT
+
+    else
+
+        draw_width =
+            screen_width
+
+        draw_height =
+            draw_width /
+            FRAME_ASPECT
+
+    end
+
+
+    local offset_x =
+        (screen_width -
+        draw_width) *
+        0.5
+
+
+    local offset_y =
+        (screen_height -
+        draw_height) *
+        0.5
+
+
+    return
+        draw_width,
+        draw_height,
+        offset_x,
+        offset_y
+
+end
+
+
+-- ============================================================
+-- DRAW FRAME
+-- ============================================================
+
+local function draw_frame()
+
+    local draw_width,
+          draw_height,
+          offset_x,
+          offset_y =
+        get_geometry()
+
+
+    for y = 1, HEIGHT do
+
+        local row =
+            pixels[y]
+
+
+        if row then
+
+            local y0 =
+                offset_y +
+                ((y - 1) / HEIGHT) *
+                draw_height
+
+
+            local y1 =
+                offset_y +
+                (y / HEIGHT) *
+                draw_height
+
+
+            local x = 1
+
+
+            while x <= WIDTH do
+
+                local pixel =
+                    row[x]
+
+
+                if not pixel then
+
+                    x = x + 1
+
+                else
+
+                    local r =
+                        pixel.r
+
+                    local g =
+                        pixel.g
+
+                    local b =
+                        pixel.b
+
+
+                    local start_x =
+                        x
+
+
+                    local run =
+                        1
+
+
+                    -- =================================================
+                    -- Merge adjacent pixels with the same RGB.
+                    -- =================================================
+
+                    while
+                        x + run <= WIDTH
+                    do
+
+                        local next =
+                            row[x + run]
+
+
+                        if not next then
+                            break
+                        end
+
+
+                        if
+                            next.r ~= r
+                            or
+                            next.g ~= g
+                            or
+                            next.b ~= b
+                        then
+
+                            break
+
+                        end
+
+
+                        run =
+                            run + 1
+
+                    end
+
+
+                    local x0 =
+                        offset_x +
+                        ((start_x - 1) / WIDTH) *
+                        draw_width
+
+
+                    local x1 =
+                        offset_x +
+                        ((start_x - 1 + run) / WIDTH) *
+                        draw_width
+
+
+                    djui_hud_set_color(
+                        r,
+                        g,
+                        b,
+                        255
+                    )
+
+
+                    djui_hud_render_rect(
+                        x0,
+                        y0,
+                        x1 - x0,
+                        y1 - y0
+                    )
+
+
+                    x =
+                        start_x + run
+
+                end
+
+            end
+
+        end
+
+    end
+
+end
+
+
+-- ============================================================
+-- UPDATE
+-- ============================================================
+
+hook_event(
+    HOOK_UPDATE,
+    function()
+
+        -- ====================================================
+        -- HOST reads ModFS.
+        -- ====================================================
+
+        if network_is_server() then
+
+            load_rgb()
+
+        end
+
+
+        -- ====================================================
+        -- One network chunk per update.
+        -- ====================================================
+
+        if
+            network_is_server()
+            and
+            sending_frame
+        then
+
+            if sending_chunk == 1 then
+
+                send_frame_start()
+
+            end
+
+
+            send_frame_chunk()
+
+
+            if sending_chunk >
+                TOTAL_CHUNKS
+            then
+
+                send_frame_end()
+
+
+                sending_frame =
+                    false
+
+                sending_data =
+                    nil
+
+            end
+
+        end
+
+    end
+)
+
+
+-- ============================================================
+-- NETWORK HOOK
+-- ============================================================
+
+hook_event(
+    HOOK_ON_PACKET_BYTESTRING_RECEIVE,
+    on_packet_bytestring_receive
+)
+
+
+-- ============================================================
+-- HUD
+-- ============================================================
+
+hook_event(
+    HOOK_ON_HUD_RENDER,
+    function()
+
+        djui_hud_set_resolution(
+            RESOLUTION_DJUI
+        )
+
+
+        -- ====================================================
+        -- No valid frame yet = black.
+        -- ====================================================
+
+        if not framebuffer_loaded then
+
+            djui_hud_set_color(
+                0,
+                0,
+                0,
+                255
+            )
+
+
+            djui_hud_render_rect(
+                0,
+                0,
+                djui_hud_get_screen_width(),
+                djui_hud_get_screen_height()
+            )
+
+
+            return
+
+        end
+
+
+        -- ====================================================
+        -- Always draw the last valid frame.
+        -- ====================================================
+
+        draw_frame()
+
+    end
+)
+
+
+-- ============================================================
+-- INITIALIZATION
+-- ============================================================
+
+create_black_frame()
+
+framebuffer_loaded =
+    false
+
+last_rgb =
+    ""
+
+
+-- ============================================================
+-- INITIAL HOST LOAD
+-- ============================================================
+
+if network_is_server() then
+
+    load_rgb()
+
+end
+
+
+print(
+    "[RGB] 320x224 persistent framebuffer initialized"
+)
