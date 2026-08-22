@@ -141,8 +141,7 @@ def write_rgb_to_modfs(rgb_text):
 
     with write_lock:
 
-        temp_path =
-            MODFS_PATH + ".tmp"
+        temp_path = MODFS_PATH + ".tmp"
 
 
         # ----------------------------------------------------
